@@ -1,0 +1,117 @@
+#!/bin/bash
+set -uo pipefail
+
+# CONFIG
+PIUSER=root
+PIHOST=10.0.0.37
+RMT_TEMPLATE="avr-XXXXX"
+AVRDUDE_PROG=avrdude
+SSH_PROG=ssh
+VERBOSE=
+# CONFIG END
+
+progname="$0"
+
+rmt_file_list=()
+ssh_running=
+ssh_cmd=
+ssh_sock=
+
+error()
+{
+	[[ -n $1 ]] && echo "${progname}: ${1}"
+	[[ -n $ssh_running ]] && close_ssh
+	exit 1
+}
+
+open_ssh()
+{
+	[[ -n $ssh_running ]] && error "ssh session already open"
+	ssh_sock=$(mktemp -u) ||
+		error "failed to fetch temporary filename"
+	ssh_cmd="${SSH_PROG} ${PIUSER}@${PIHOST} -S $ssh_sock"
+	$ssh_cmd -M -fnNT -L 50000:localhost:3306 ||
+		error "failed to open ssh session"
+	ssh_running="YES"
+	[[ -n $VERBOSE ]] && echo "Created ssh socket: ${ssh_sock}"
+}
+
+close_ssh()
+{
+	[[ -z $ssh_running ]] && error "ssh session not open"
+	$ssh_cmd -O exit &> /dev/null ||
+		{ echo "failed to close ssh session"; exit 1; }
+	ssh_running=
+	ssh_cmd=
+	ssh_sock=
+}
+
+rmt_cleanup()
+{
+	[[ -z $ssh_running ]] && error "ssh session not open"
+	$ssh_cmd "rm ${rmt_file_list[*]}" ||
+		error "failed to cleanup temp files on raspberry"
+
+}
+
+# List of options that shall be forwarded to avrdude on the remote
+# host. The -U options are excluded from this list as they are
+# managed instide the ops array.
+opts=()
+
+# List of operations specified via the -U option. For each
+# -U <operation> pair the array contains an entry with <operation>.
+ops=()
+
+# Initialize opts and ops.
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		-U)
+			[[ -z $2 ]] && error "missing operation for -U"
+			ops+=("$2")
+			shift
+			;;
+		*)
+			opts+=("$1")
+			;;
+	esac
+	shift
+done
+
+[[ -n $VERBOSE ]] && echo "Options: ${opts[@]}"
+[[ -n $VERBOSE ]] && echo "Operations: ${ops[@]}"
+
+echo "Connect to Raspberry Pi..."
+open_ssh
+
+for i in "${!ops[@]}"; do
+
+	# Extract local filename of operation.
+	IFS=: read -a op_comps <<< "${ops[i]}"
+
+	lcl_file="${op_comps[2]}"
+	[[ -e $lcl_file ]] || error "file ${lcl_file} doesn't exist"
+	[[ -r $lcl_file ]] || error "can't access file ${lcl_file}"
+
+	# Create remote file and upload local file. Remote file must have
+	# the same extension as the local one.
+	lcl_ext="${lcl_file##*.}"
+	rmt_file=$($ssh_cmd "mktemp ${lcl_ext:+--suffix .$lcl_ext}") ||
+		error "failed to create temp file on raspberry"
+	rmt_file_list+=("$rmt_file")
+	cat $lcl_file | $ssh_cmd "cat >> ${rmt_file}" ||
+		{ rmt_cleanup; error "failed to upload local file"; }
+
+	# Adjust filename in opts array for remote execution.
+	op_comps[2]="$rmt_file"
+	ops[i]=$(IFS=:; echo "${op_comps[*]}")
+
+done
+
+prog_cmd="${AVRDUDE_PROG} ${opts[*]}${ops[@]/#/ -U }"
+[[ -n $VERBOSE ]] && echo "Execute avrdude: ${prog_cmd}"
+$ssh_cmd "$prog_cmd" ||
+	{ rmt_cleanup; error "failed to execute avrdude on raspberry"; }
+
+rmt_cleanup
+close_ssh
